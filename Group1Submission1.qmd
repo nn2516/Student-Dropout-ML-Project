@@ -1,0 +1,93 @@
+---
+title: "Submission 1"
+format: html
+editor: visual
+author: "Group 1"
+---
+
+#### Initialization
+
+```{r}
+
+# load libraries
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(caret)
+
+# clear environment
+rm(list=ls())
+
+# set path for working directory
+path <- '~/Desktop/Midterm'
+setwd(path)
+
+```
+
+#### Load Data
+
+```{r}
+
+Data <- read_csv(paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermData.csv',sep=''))
+
+```
+
+#### Remove certain columns
+
+```{r}
+
+Data <- select(Data, -c('TotalGrants', 'TotalDebt', 'TotalScholarships', 'TotalWorkStudy' 'BirthMonth', 'BirthYear', 'RealNA', 'Adjusted Gross Income', 'Parent Adjusted Gross Income'))
+
+
+```
+
+#### Create test and train set
+
+```{r}
+
+#Create test set and save as kaggletest:
+test.dat <- filter(Data, is.na(Dropout))
+write_csv(test.dat, paste(path,'/hud4050studentdropoutfall22/kaggletest.csv',sep=''))
+
+#Create training set
+train.dat <- filter(Data, !is.na(Dropout))
+```
+
+#### Logistic regression model
+
+```{r}
+
+set.seed(1337)
+trctrl <- trainControl(method = "cv", number = 10, 
+                       savePredictions = T)
+
+logitmodel <- train(Dropout ~ ., method='glm',
+                preProcess=c('scale', 'center'), 
+                data=train.dat, 
+                trControl=trctrl,
+                family=binomial(link='logit'),
+                na.action=na.exclude
+                )
+
+
+summary(logitmodel)
+
+#Predict model
+predictions_logit <- predict(logitmodel, newdata = test.dat)
+
+varImp(logitmodel)
+
+
+```
+
+#### Save predictions as new dataframe and as a .csv file
+
+```{r}
+
+X = merge(test.dat$StudentID, predictions_logit)
+
+
+X = data.frame(StudentID = test.dat$StudentID, Dropout = predictions_logit)
+
+write_csv(X, paste(path,'/hud4050studentdropoutfall22/Group1_Submission1.csv',sep=''))
+```
