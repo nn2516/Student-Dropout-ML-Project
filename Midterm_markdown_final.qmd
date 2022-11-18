@@ -1,0 +1,1077 @@
+---
+title: "mid-term project"
+author: "Group 1"
+date: "2022-11-11"
+format: html
+editor: visual
+---
+
+# #1.Initialization set up the environment
+
+```{r message = F}
+# load libraries
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(cluster)
+library(patchwork)
+library(caret)
+library(xgboost)
+library(pROC) #ROC-curve using pROC library
+library(pdp)
+
+# clear environment
+rm(list=ls())
+
+# set path for working directory
+# path <- '~/Desktop/Midterm'
+path <- '~/Desktop/Midterm'
+setwd(path)
+
+```
+
+# #2. Data Wrangling
+
+Initially we merged all the csv files into a single dataframe but that resulted in over 700 columns (thanks JD). Most of the columns were from the student progress csv with duplicates for different terms. So we decided to just use the progress csv from the last term each student was enrolled. As the last term a student was enrolled should have the most important information for their dropout decision, this also made substantive sense.
+
+## First thing is to find what are the last terms for each student.
+
+### Get a list of all the student IDs
+
+```{r message = F}
+trainIDs <- read_csv(paste(path,'/hud4050studentdropoutfall22/DropoutTrainLabels.csv',sep=''))
+trainIDs <- select(trainIDs,StudentID)
+testIDs <- read_csv(paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Test Data/TestIDs.csv',sep=''))
+FinancialIDs <- read_csv(paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Financial Aid Data/2011-2017_Cohorts_Financial_Aid_and_Fafsa_Data.csv',sep=''))
+FinancialIDs <- select(FinancialIDs,StudentID)
+```
+
+### Student IDs from the financial csv is the largest list. Check if it contains the other IDs from student progress and static csv
+
+```{r message = F}
+# print(all(trainIDs$StudentID %in% FinancialIDs$StudentID))
+# print(all(testIDs$StudentID %in% FinancialIDs$StudentID))
+```
+
+### Since FinancialIDs were most comprehensive, we will use this as the starting list. In order to find the last term for each student we need to define terms chronologically and make a table of 0's and 1's for student enrollment
+
+```{r message = F}
+Terms <- c("Fall 2011","Spring 2012","Sum 2012","Fall 2012","Spring 2013","Sum 2013","Fall 2013","Spring 2014","Sum 2014","Fall 2014","Spring 2015","Sum 2015","Fall 2015","Spring 2016","Sum 2016","Fall 2016","Spring 2017","Sum 2017")
+StudentID <- FinancialIDs
+TermEnrollment <- data.frame(StudentID)
+
+# preallocate first term and last term variable which will be used later to determine the number of terms a student has been enrolled to that point.
+TermEnrollment$FirstTerm = rep(NA,length(StudentID$StudentID))
+TermEnrollment$LastTerm = rep(NA,length(StudentID$StudentID))
+
+# initialize term enrollments in data frame as 0
+for (i in 1:length(Terms)){
+  TermEnrollment[Terms[i]] <- rep(0,length(StudentID$StudentID))
+}
+
+# make entries 1 if student is enrolled
+for (i in 1:length(Terms)){
+  foldername <- paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Progress Data/',sep='')
+  temp <- read_csv(paste(foldername,Terms[i],'_SP.csv',sep=''))
+  ind <- TermEnrollment$StudentID %in% temp$StudentID
+  TermEnrollment[ind,Terms[i]] = 1
+}
+
+# get first and last terms
+vars <- colnames(TermEnrollment)
+for (i in 1:length(StudentID$StudentID)){
+  ind = which(TermEnrollment[i,]==1)
+  TermEnrollment[i,"FirstTerm"] = vars[ind[1]]
+  TermEnrollment[i,"LastTerm"] = vars[ind[length(ind)]]
+}
+
+# check for missing values
+# print(sum(is.na(TermEnrollment$FirstTerm)))
+# print(sum(is.na(TermEnrollment$LastTerm)))
+```
+
+### We save this table for future use because it contains information for which term each student was enrolled in.
+
+```{r message = F}
+write_csv(TermEnrollment, paste(path,'/hud4050studentdropoutfall22/TermEnrollment.csv',sep=''))
+```
+
+## The next step is to combine the last term data of student progress with the financial and static data
+
+### Get just the last term data for each student into a single dataframe
+
+```{r message = F}
+LastTermData <- data.frame()
+for (i in 1:length(Terms)){
+  foldername <- paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Progress Data/',sep='')
+  temp <- read_csv(paste(foldername,Terms[i],'_SP.csv',sep=''))
+  termIDs <- TermEnrollment$StudentID[TermEnrollment$LastTerm==Terms[i]]
+  ind <- temp$StudentID %in% termIDs
+  temp <- temp[ind,]
+  LastTermData <- rbind(LastTermData,temp)
+}
+# get rid of cohort and cohort term because they are redundant variables
+LastTermData <- select(LastTermData,!c("Cohort","CohortTerm"))
+```
+
+### Now we need to combine it with the Financial and Static csv files. Get student static data
+
+```{r message = F}
+staticpath <- paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Static Data/',sep='')
+staticfiles <- dir(staticpath,recursive = TRUE,pattern = '.csv')
+
+# Combine Static Data
+StaticData <- data.frame()
+for (i in 1:length(staticfiles)){
+  temp <- read_csv(paste(staticpath,staticfiles[i],sep=''))
+  StaticData <- rbind(StaticData,temp)
+}
+
+# keep cohort and cohort term cause this data will be first
+```
+
+### Get student financial data
+
+```{r message = F}
+financialpath <- paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Financial Aid Data/',sep='')
+FinancialData <- read_csv(paste(financialpath,'2011-2017_Cohorts_Financial_Aid_and_Fafsa_Data.csv',sep=''))
+
+# get rid of cohort and cohort term because they are redundant variables
+FinancialData <- select(FinancialData,!c("cohort","cohort term"))
+```
+
+### Combine the static, last term, and financial data into one data frame
+
+```{r message = F}
+# get rid of cohort and cohort term
+LastTermData <- merge(FinancialData,LastTermData,by="StudentID")
+LastTermData <- merge(StaticData,LastTermData,by="StudentID",sort=TRUE)
+
+# check that all the training and test StudentIDs are in the new dataframe
+# print(all(trainIDs$StudentID %in% LastTermData$StudentID))
+# print(all(testIDs$StudentID %in% LastTermData$StudentID))
+
+```
+
+### This is the dataframe we will initially work with. So save this table for future use!
+
+```{r message = F}
+write_csv(LastTermData, paste(path,'/hud4050studentdropoutfall22/LastTermData.csv',sep=''))
+```
+
+### After integrating the data, now we have comprehensive data (13261 rows and 79 variables)
+
+------------------------------------------------------------------------
+
+# **#3. Exploratory Data Analysis, Cleaning, and Feature Engineering**
+
+## Our next step is to reformat and clean up this dataframe while creating new variables along the way.
+
+### Load data along with Dropout labels
+
+```{r message = F}
+Data <- read_csv(paste(path,'/hud4050studentdropoutfall22/LastTermData.csv',sep=''))
+Dropout <- read_csv(paste(path,'/hud4050studentdropoutfall22/DropoutTrainLabels.csv',sep=''))
+Data <- merge(Dropout,Data,by="StudentID",all=TRUE)
+```
+
+### We will want to investigate which variables seem to relate to dropout. Therefore, we will create one function to summarize dropout rate by variable and another function to visualize (plot) the relationship
+
+```{r message = F}
+# summary function
+summarize_dropoutrate_by_var <- function(var){
+  # var = string of variable name (e.g. 'CumGPA')
+  # colorvar = string of variable name (e.g. 'NumTermsEnrolled')
+  summ <- Data %>%
+    group_by(.data[[var]]) %>%
+    summarise(n=n(), dropoutrate=mean(Dropout,na.rm=T))
+  print(summ)
+}
+
+# plot function
+plot_dropoutrate_by_var <- function(var,colorvar){
+  # var = string of variable name (e.g. 'CumGPA')
+  # colorvar = string of variable name (e.g. 'NumTermsEnrolled')
+  # colorvar needs to be a numeric variable
+  if (class(Data[[var]])=="numeric"){
+    plt <- Data %>%
+      group_by(.data[[var]]) %>%
+      summarise(n=n(), dropoutrate=mean(Dropout,na.rm=T), col=mean(.data[[colorvar]])) %>%
+      ggplot(aes(x=.data[[var]], y=dropoutrate, color=col)) + geom_point() + labs(x=var) + scale_color_gradientn(colours=rainbow(5)) + geom_smooth(method="lm", mapping = aes(weight = n), se=FALSE)
+  }
+    else {
+      Data %>%
+      group_by(.data[[var]]) %>%
+      summarise(n=n(), dropoutrate=mean(Dropout,na.rm=T))
+      plt <- Data %>% 
+        filter(!is.na(Dropout)) %>% 
+        mutate(Dropout=as.factor(Dropout)) %>%
+        ggplot(aes(x=.data[[var]], y=..count.., fill=Dropout)) + geom_bar(position='dodge')
+  }
+  print(plt)
+}
+```
+
+### We want to get each student's time enrolled and number of terms enrolled in order to use for feature creation (such as average grants per term, etc.)
+
+```{r message = F}
+Terms <- read_csv(paste(path,'/hud4050studentdropoutfall22/TermEnrollment.csv',sep=''))
+Data$NumTermsEnrolled <- rep(NaN,dim(Data)[1])
+Data$TimeEnrolled <- rep(NaN,dim(Data)[1])
+ind <- match(Data$StudentID,Terms$StudentID)
+for (i in 1:length(Data$StudentID)){
+  termsenrolled = which(Terms[ind[i],]==1)
+  Data$NumTermsEnrolled[i] = length(termsenrolled)
+  Data$TimeEnrolled[i] = termsenrolled[length(termsenrolled)] - termsenrolled[1] + 1
+}
+```
+
+### We identified some variables that we wanted to remove for various reasons. We first removed address primarily because the majority of students were from New Jersey (we used table(Data\$State) to see this). The rest of the removed variables had only 1 unique value so were not informative.
+
+```{r message = F}
+Data <- select(Data, -c("Campus", "Zip", "City", "State", "Address1", "Address2","HSGPAWtd" ,"FirstGen","DualHSSummerEnroll", "CumLoanAtEntry","Complete2", "CompleteCIP2", "TransferIntent", "DegreeTypeSought"))
+```
+
+### After removing these variables, we also reduced the number of dimensions within the "Majors" columns two ways. First we replaced the specific major (e.g. mechanical engineering) with the general major (e.g. engineering) by using the floor function. Second, we binned the majors into broad subjects.
+
+```{r message = F}
+# https://nces.ed.gov/ipeds/cipcode/browse.aspx?y=55
+
+# replace major with generalized major
+Data$Major1 <- floor(Data$Major1)
+Data$Major2 <- floor(Data$Major2)
+Data$CompleteCIP1 <- floor(Data$CompleteCIP1)
+
+# We made a csv file to perform the binning 
+Majors <- read_csv(paste(path,'/hud4050studentdropoutfall22/Majors.csv',sep=''))
+
+# but here is an example of what we did:
+# Major1 == 05 ~ 'Arts',
+# Major1 == 13 ~ 'Arts',
+# Major1 == 23 ~ 'Arts',
+# Major1 == 24 ~ 'Arts',
+# Major1 == 38 ~ 'Arts',
+# Major1 == 50 ~ 'Arts',
+# Major1 == 54 ~ 'Social Sciences',
+# Major1 == 09 ~ 'Social Sciences',
+# Major1 == 16 ~ 'Social Sciences',
+# Major1 == 42 ~ 'Social Sciences',
+# Major1 == 45 ~ 'Social Sciences',
+# Major1 == 52 ~ 'Social Sciences',
+# Major1 == 26 ~ 'Math and STEM',
+# Major1 == 27 ~ 'Math and STEM',
+# Major1 == 40 ~ 'Math and STEM',
+# Major1 == 51 ~ 'Math and STEM',
+# Major1 == 11 ~ 'Math and STEM',
+# Major1 == 43 ~ 'Math and STEM',
+# Major1 == 0 ~ 'Undeclared',
+# Major1 == -1 ~ 'Unknown'
+
+vars = c('Major1','Major2','CompleteCIP1')
+for (v in 1:length(vars)){ 
+  for (m in 1:dim(Majors)[1]){
+    ind = which(Data[[vars[v]]]==Majors$CIP[[m]])
+    Data[ind,vars[v]] = Majors$Class[[m]]
+  }
+}
+
+# Make Complete1 dichotomous (because we felt B.S. versus B.A. was not important). This just remains if the student got a degree or not
+Data$Complete1 <- Data$Complete1>0
+
+```
+
+### EDA: Check dropout rate by some variables. We did this for more than only these variables to see whether they could be important in predicting student dropout.
+
+```{r}
+suppressWarnings({
+  # continuous variable
+  summarize_dropoutrate_by_var('CumGPA')
+  plot_dropoutrate_by_var('CumGPA','NumTermsEnrolled')
+  
+  # categorical variable
+  summarize_dropoutrate_by_var('Major1')
+  plot_dropoutrate_by_var('Major1','NumTermsEnrolled')
+})
+```
+
+### We noted some variable names are hard to use because of aposthrophes so we changed the column names
+
+```{r message = F}
+ind <- grep("Mother's Highest Grade Level", colnames(Data))
+colnames(Data)[ind] <- 'MothersEducation'
+
+ind <- grep("Father's Highest Grade Level", colnames(Data))
+colnames(Data)[ind] <- 'FathersEducation'
+```
+
+### Replace NAs with Unknown in some non-numeric variables
+
+```{r message = F}
+vars = c('Marital Status','MothersEducation','FathersEducation','Housing')
+for (v in 1:length(vars)){
+  Data[vars[v]][is.na(Data[vars[v]])] <- "Unknown"
+  # check dropout rate. 
+  summarize_dropoutrate_by_var(vars[v])
+  plot_dropoutrate_by_var(vars[v],'NumTermsEnrolled')
+}
+```
+
+### Replace Financial NAs with 0, since an NA in Loans, Scholarship, Work/Study or Grants should mean that a person did not receive such funding; funding hence = 0.
+
+```{r message = F}
+vars = c(' Loan','Scholarship','Work/Study','Grant')
+for (v in 1:length(vars)){
+  var = vars[v]
+  cols = colnames(Data)
+  ind = cols[grep(var,cols,fixed=TRUE)]
+  Data[,ind][is.na(Data[,ind])] <- 0
+}
+```
+
+### In order to reduce the dimensions of the ethnicity variable we also binned them into categories based on number of observations within each ethnicity and using the table function. Since there were not many American Indians, Native Hawaiians or people identifying with two or more Races, we binned them into one category.
+
+```{r message = F}
+##Creating new ethnicity variable:
+Data <- Data %>%
+  mutate(Ethnicity = case_when(Hispanic == 1 ~ 'Hispanic',
+                               Asian == 1 ~ 'Asian',
+                               Black == 1 ~ 'Black',
+                               White == 1 ~ 'White',
+                               AmericanIndian == 1  ~ 'Other',
+                               NativeHawaiian == 1 ~ 'Other',
+                               TwoOrMoreRace == 1 ~ 'Other'
+                               ))
+Data$Ethnicity[is.na(Data$Ethnicity)] = 'Unknown'
+
+#Drop previous ethnicity variables:
+Data <- select(Data, - c('Hispanic', 'AmericanIndian', 'Asian', 'Black', 
+                                         'NativeHawaiian', 'White', 'TwoOrMoreRace'))
+# check dropout rate
+summarize_dropoutrate_by_var('Ethnicity')
+plot_dropoutrate_by_var('Ethnicity','Ethnicity')
+```
+
+### Creating a new cohort variable as a factor instead of strings. Transformed to square root to make it linear with dropout rate.
+
+```{r message = F}
+##Creating new Cohort ordinal variable:
+Data$Cohort <- recode_factor(Data$Cohort, "2011-12" = 1, "2012-13" = 2, "2013-14" = 3, "2014-15" = 4, "2015-16" = 5, "2016-17" = 6)
+
+# trying some transformations to make the plot look linear
+Data$Cohort <- as.numeric(Data$Cohort)
+Data$Cohort <- 6 - Data$Cohort
+Data$Cohort <- sqrt(Data$Cohort)
+
+# check dropout rate
+summarize_dropoutrate_by_var('Cohort')
+plot_dropoutrate_by_var('Cohort','NumTermsEnrolled')
+```
+
+### We created a new age variable based on birth year and birth month
+
+```{r message = F}
+#Creating new Age variable:
+x_date   <- as.Date("2022-11-05")
+Data$Birth_date<- paste(Data$BirthYear,c("-"),Data$BirthMonth,sep="")
+Data$Birth_date <- as.Date(Data$Birth_date,"%Y - %M")
+Data$Age <- trunc(as.numeric(difftime(x_date, Data$Birth_date, units = "days")) / 365.25)
+
+# check dropout rate
+# summarize_dropoutrate_by_var('Age')
+# plot_dropoutrate_by_var('Age','NumTermsEnrolled')
+```
+
+### Get Total Financial Information: the idea is to take a ratio of this per time at the university. Especially Work/Study could be informative since people should not have much time to study when they work a lot.
+
+```{r message = F}
+Data <- Data %>%
+  mutate(TotalDebt = `2012 Loan`+`2013 Loan`+`2014 Loan`+`2015 Loan`+`2016 Loan`+`2017 Loan`) %>%
+  mutate(TotalGrants = `2012 Grant`+`2013 Grant`+`2014 Grant`+`2015 Grant`+`2016 Grant`+`2017 Grant`)%>%
+  mutate(TotalScholarships = `2012 Scholarship`+`2013 Scholarship`+`2014 Scholarship`+`2015 Scholarship`+`2016 Scholarship`+`2017 Scholarship`)%>%
+  mutate(TotalWorkStudy = `2012 Work/Study`+`2013 Work/Study`+`2014 Work/Study`+`2015 Work/Study`+`2016 Work/Study`+`2017 Work/Study`)%>%
+  mutate(AvgDebtPerTerm = TotalDebt/NumTermsEnrolled) %>% 
+  mutate(AvgGrantsPerTerm = TotalGrants/NumTermsEnrolled) %>% 
+  mutate(AvgScholarshipsPerTerm = TotalScholarships/NumTermsEnrolled) %>% 
+  mutate(AvgWorkStudyPerTerm = TotalWorkStudy/NumTermsEnrolled)
+
+# # check dropout rates for the variables.
+# vars = c('AvgDebtPerTerm','AvgGrantsPerTerm','AvgScholarshipsPerTerm','AvgWorkStudyPerTerm')
+# for (v in 1:length(vars)){
+#   summarize_dropoutrate_by_var(vars[v])
+#   plot_dropoutrate_by_var(vars[v],'NumTermsEnrolled')
+# }
+```
+
+### We noticed that the dataset had systematic NAs in that some people seem not to have any data except for some static data. Therefore, we created a new variable called "Real NA" in order to capture this information.
+
+```{r message = F}
+Data <- Data %>%
+  mutate(RealNA = case_when((HSGPAUnwtd == -1) & (Housing == "Unknown")  & (is.na(`Adjusted Gross Income`)) & (CompleteDevMath == -1) & (CompleteDevEnglish == -1) ~ 1,
+  TRUE ~ 0
+  ))
+
+var = 'RealNA'
+# summarize_dropoutrate_by_var('RealNA')
+onlyNA <- filter(Data, (RealNA ==1) & (AcademicYear != "2016-17"))
+# View(onlyNA)
+
+```
+
+### We then transformed the following numerical variables into factor variables.
+
+```{r message = F}
+vars = c("Dropout","CohortTerm","Gender","HSDip","EnrollmentStatus","HighDeg","MathPlacement","EngPlacement","GatewayMathStatus","GatewayEnglishStatus","Term","CompleteDevMath","CompleteDevEnglish","RealNA")
+for (v in 1:length(vars)){
+  Data[[vars[v]]] <- as.factor(Data[[vars[v]]])
+}
+```
+
+### We then checked the unique values for each variable and then removed redundant ones.
+
+```{r message = F}
+vars = colnames(Data)
+vars = vars[!(vars %in% c('StudentID','RegistrationDate','Adjusted Gross Income','Parent Adjusted Gross Income'))]
+to_remove = c('Loan','Scholarship','Work/Study','Grant','Debt','WorkStudy','GPA')
+for (i in 1:length(to_remove)){
+  ind = grep(to_remove[i],vars,fixed=TRUE)
+  vars = vars[-ind]
+}
+# print(vars)
+
+# for (v in 1:length(vars)){
+#   cat('\n')
+#   print(vars[v])
+#   print(unique(Data[[vars[v]]]))
+# }
+
+```
+
+### EDA: We also checked the stats of specific variables and generated plots for our presentation.
+
+```{r message = F}
+suppressWarnings({
+  # summarize_dropoutrate_by_var('CumGPA')
+  # plot_dropoutrate_by_var('CumGPA','NumTermsEnrolled')
+  
+  # Notes
+  
+  # Some people with non-zero Complete1 appear to have dropped out ...
+  mean(Data$Dropout[Data$Complete1>0],na.rm=T)
+  ind = which(Data$Complete1>0 & Data$Dropout==1)
+  Test = Data[ind,] # These students look like they should not be classified as dropout
+  # In an email correspondence, J.D. confirmed that these are true dropouts
+})
+```
+
+### We conducted "PCA" for both numerical and categorical variables which is referred to as Factor Analysis of Mixed Data (FAMD). We visualized the principal components using an external package.
+
+```{r message = F}
+suppressWarnings({
+  ## Import libraries
+  library("FactoMineR")
+  library("factoextra")
+  suppressPackageStartupMessages(library(FactoMineR))
+  suppressPackageStartupMessages(library(factoextra))
+  
+  ## FAMD
+  vars <- c('Dropout','Marital Status','Major1','CumGPA','Age','NumTermsEnrolled','Ethnicity')
+  df <- select(Data,all_of(vars))
+  df <- df[which(rowSums(is.na(df))==0),] # remove missing values cause it seems to mess it up
+  res.famd <- FAMD(df, 
+                   sup.var = 'Dropout',  ## Set the target variable "Churn" as a supplementary variable
+                   graph = FALSE, 
+                   ncp=25)
+  
+  ## Inspect principal components
+  get_eigenvalue(res.famd)
+  ## Set figure size
+  options(repr.plot.width = 14, repr.plot.height = 12)
+  
+  ## Plot individual observations
+  fviz_famd_ind(res.famd, label = "none", 
+                habillage = "Dropout", palette = c("#00AFBB", "#FC4E07"), # color by groups 
+                repel = TRUE, alpha.ind = 0.25, addEllipses = TRUE) + 
+      xlim(-5, 6) + ylim (-4.5, 4.5) +
+      theme(text = element_text(size=20), axis.text.x = element_text(size=20), axis.text.y = element_text(size=20))
+})
+
+
+```
+
+#### Note that we did not end up using the PCA/FAMD variables because it did not appear to improve the F1 in a logistic model. This is not shown in our report, but would not be difficult to do.
+
+### Save the file as data set for modeling.
+
+```{r message = F}
+write_csv(Data, paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermData.csv',sep=''))
+```
+
+# #4. Initial Modeling
+
+### Load Data. We ensured that some of the numeric variables were converted to factors. We also ran into issues with running the models because some variables were redundant (linearly dependent) so we removed these from the dataframe.
+
+```{r message = F}
+Data <- read_csv(paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermData.csv',sep=''))
+
+# convert some variables to factor (from numerical)
+vars = c("Dropout","CohortTerm","Gender","HSDip","EnrollmentStatus","HighDeg","MathPlacement","EngPlacement","GatewayMathStatus","GatewayEnglishStatus","Term","CompleteDevMath","CompleteDevEnglish","RealNA")
+Data[vars] <- lapply(Data[vars], factor)  ## as.factor() could also be used
+
+Data <- select(Data, -c('TotalGrants', 'TotalDebt', 'TotalScholarships', 'TotalWorkStudy', 'RealNA', "Major2","CompleteCIP1","HSDipYr","HSGPAUnwtd","NumColCredAttemptTransfer","Adjusted Gross Income","Parent Adjusted Gross Income","BirthYear","BirthMonth","Birth_date"))
+
+```
+
+### Create test and train set:
+
+```{r message = F}
+
+#Create test data set and save as kaggletest:
+test.dat <- filter(Data, is.na(Dropout))
+write_csv(test.dat, paste(path,'/hud4050studentdropoutfall22/kaggletest.csv',sep=''))
+
+train.dat <- filter(Data, !is.na(Dropout))
+
+```
+
+#### We first ran a Logistic Regression model since it is an easily comprehensible and implementable model for classification using both continuous and categorical predictors.
+
+```{r message = F}
+
+suppressWarnings({
+  set.seed(1337)
+  trctrl <- trainControl(method = "cv", number = 10, 
+                         savePredictions = T)
+  logitmodel <- train(Dropout ~ ., method='glm',
+                  preProcess=c('scale', 'center'), 
+                  data=train.dat, 
+                  trControl=trctrl,
+                  family=binomial(link='logit'),
+                  na.action=na.exclude
+                  )
+  summary(logitmodel)
+  #Predict model
+  predictions_logit <- predict(logitmodel, newdata = test.dat)
+  #Save predictions:
+  X = merge(test.dat$StudentID, predictions_logit)
+  nrow(X)
+  X = data.frame(StudentID = test.dat$StudentID, Dropout = predictions_logit)
+  write_csv(X, paste(path,'/hud4050studentdropoutfall22/Group1_Submission1.csv',sep=''))
+
+})
+
+```
+
+#### After initially choosing a logistic regression, we then employed a SVM since it is less prone to overfitting. SVM however did not result in a higher F-measure than our base logistic regression model.
+
+```{r message = F}
+
+set.seed(1337)
+svm1 <- train(Dropout ~., 
+              data=train.dat, 
+              method="svmRadial",
+              trControl = trctrl,  
+              preProcess = c("center","scale"),
+              sigma =.2,
+              na.action = na.exclude)
+summary(svm1)
+#Predict model
+predictions_svm <- predict(svm1, newdata = test.dat)
+##save svm boost predictions:
+X3 = merge(test.dat$StudentID, predictions_svm)
+X3 = data.frame(StudentID = test.dat$StudentID, Dropout = predictions_svm)
+write_csv(X3, paste(path,'/hud4050studentdropoutfall22/SVMpredictions.csv',sep=''))
+```
+
+#### Next, we used LDA. We tried a similar model to logistic regression seeing whether it might perform slightly better. However, the LDA model was again not better than our base logistic regression model based on its F-measure.
+
+```{r}
+
+set.seed(1337)
+lda_fit <- train(Dropout~., method='lda',data=train.dat,na.action = na.exclude,
+                 trControl=trctrl)
+lda_fit$finalModel
+predictions_lda <- predict(lda_fit, newdata = test.dat, type="raw")
+head(predictions_lda)
+# sum(as.numeric(predictions_lda) == as.numeric(predictions_logit))
+##save lda predictions:
+X4 = merge(test.dat$StudentID, predictions_lda)
+X4 = data.frame(StudentID = test.dat$StudentID, Dropout = predictions_lda)
+write_csv(X4, paste(path,'/hud4050studentdropoutfall22/LDApredictions.csv',sep=''))
+
+```
+
+#### After reporting our initial predictions using a logistic regression, svm, and lda we employed a random forest model since trees seem to fare better with multiple categorical predictors. Additionally, using a random forest model, which is an ensemble model, should end up with better predictions than a simple model like logistic regression. The F-measure however, was quite similar to the logistic regression.
+
+```{r message = F}
+
+# THIS WILL TAKE ALL DAAAYYYY - or even more than one day, we therefore commented it out.
+
+# set.seed(1337)
+# 
+# trctrl1 <- trainControl(method = "cv", number = 5)
+# forest_fit <- train(Dropout ~ ., 
+#                     data = train.dat, 
+#                     method = "rf",
+#                     importance = T,
+#                     na.action=na.exclude, 
+#                     tuneGrid = expand.grid(mtry = seq(1, ncol(train.dat)-1)),
+#                     ntree = 500,
+#                     trControl=trctrl1)
+# 
+# forest_fit$results
+# 
+# #To see the tuned mtry parameter.  Mtry is the number of randomly selected predictors
+# forest_fit$bestTune
+# #Plot mtry parameter tuning runs
+# plot(forest_fit)
+# #Predict
+# predictions_forest <- predict(forest_fit, newdata = test.dat)
+# 
+# #To see the importance of the variables
+# forestImp <- varImp(forest_fit)
+# forestImp
+# plot(forestImp)
+# 
+# # sum(as.numeric(predictions_forest) == as.numeric(predictions_logit))
+```
+
+#### As gradient boost models perform better than a random forest model when parameters are tuned carefully, we employed a gradient boost model in our next step. Additionally gradient boost models seem to fare better with unbalanced data which in our data set would be for instance, the choice of majors. The gradient boost model was our highest performing model.
+
+```{r message = F}
+
+# COMMENTED OUT BECAUSE IT PRODUCES A LOT OF WARNINGS
+
+# suppressWarnings({
+#   set.seed(1337)
+#   boost_fit <- train(Dropout ~ ., method = "xgbTree", data=train.dat,na.action=na.exclude,
+#                      trControl=trctrl)
+#   
+#   boost_fit
+#   boost_fit$bestTune
+#   #Plot parameter tuning runs
+#   plot(boost_fit)
+#   #Predict
+#   predictions_boost <- predict(boost_fit, newdata = test.dat)
+#   
+#   ##save xgb boost predictions:
+#   X2 = merge(test.dat$StudentID, predictions_boost)
+#   X2 = data.frame(StudentID = test.dat$StudentID, Dropout = predictions_boost)
+#   write_csv(X2, paste(path,'/hud4050studentdropoutfall22/XGBpredictions.csv',sep=''))
+# })
+
+```
+
+# ##5. Modeling with additional features
+
+### We tried to improve upon the previous models by adding more "time" features which were extracted from our Term Enrollment dataframe
+
+#### Load Data
+
+```{r message = F}
+TermEnrollment <- read_csv(paste(path,'/hud4050studentdropoutfall22/TermEnrollment.csv',sep=''))
+Terms <- colnames(select(TermEnrollment,contains(" 20")))
+Dropout <- read_csv(paste(path,'/hud4050studentdropoutfall22/DropoutTrainLabels.csv',sep=''))
+```
+
+#### Get Major and GPA per Term
+
+```{r message = F}
+TermMajor <- data.frame(StudentID=TermEnrollment$StudentID)
+TermGPA <- data.frame(StudentID=TermEnrollment$StudentID)
+
+for (i in 1:length(Terms)){
+  foldername <- paste(path,'/hud4050studentdropoutfall22/Student Retention Challenge Data/Student Progress Data/',sep='')
+  temp <- read_csv(paste(foldername,Terms[i],'_SP.csv',sep=''))
+  # Majors
+  TermMajor <- merge(TermMajor,select(temp,c("StudentID","Major1")),by="StudentID",all=T)
+  TermMajor[Terms[i]] <- TermMajor$Major1
+  TermMajor <- select(TermMajor,-c("Major1"))
+  # GPAs
+  TermGPA <- merge(TermGPA,select(temp,c("StudentID","TermGPA")),by="StudentID",all=T)
+  TermGPA[Terms[i]] <- TermGPA$TermGPA
+  TermGPA <- select(TermGPA,-c("TermGPA"))
+}
+```
+
+#### Analyze Enrollment Stability
+
+```{r}
+# 3 categories: ALLstable, FSstable, Unstable
+# Allstable means they continuously enrolled in fall, spring, summer terms
+# FSstable means they continuously enrolled in fall, spring terms only
+# Unstable means neither of the above
+
+EnrollmentStability <- data.frame(StudentID=TermEnrollment$StudentID,
+                                  EnrollmentStability=rep(NaN,dim(TermEnrollment)[1],1))
+for (id in 1:dim(TermEnrollment)[1]){
+  first <- which(colnames(TermEnrollment)==TermEnrollment$FirstTerm[[id]])
+  last <- which(colnames(TermEnrollment)==TermEnrollment$LastTerm[[id]])
+  enrollment <- TermEnrollment[id,first:last]
+  if (rowSums(enrollment)==length(enrollment)){
+    EnrollmentStability$EnrollmentStability[[id]] = "Allstable"
+  }
+  else {
+    enrollment <- select(enrollment,!contains("Sum")) # remove summer terms
+    if (rowSums(enrollment)==length(enrollment)){
+      EnrollmentStability$EnrollmentStability[[id]] = "FSstable"
+    }
+    else {
+      EnrollmentStability$EnrollmentStability[[id]] = "Unstable"
+    }
+  }
+}
+```
+
+#### Add GPA Slope to see whether the GPA of a student changed drastically during terms.
+
+```{r}
+slope  <-  function(x){
+    if(all(is.na(x)))
+        # if x is all missing, then lm will throw an error that we want to avoid
+        return(NA)
+    else
+        return(coef(lm(unlist(x)~seq_along(x)))[2])
+}
+
+GPAStability <- data.frame(StudentID=TermEnrollment$StudentID)
+GPAStability$GPASlope <- apply(TermGPA[,Terms],1,slope)
+GPAStability$GPASlope[is.na(GPAStability$GPASlope)] = 0;
+```
+
+#### Create a variable reflecting whether students changed their major.
+
+```{r}
+MajorChanges <- data.frame(StudentID=TermEnrollment$StudentID)
+MajorChanges$MajorChanges <- apply(TermMajor[,Terms], 1, function(x)(length(unique(na.omit(x)))-1))
+
+MajorChanges$MajorChanges <- case_when(MajorChanges$MajorChanges==0 ~ 0, MajorChanges$MajorChanges>0 ~ 1)
+```
+
+#### Combine results with the original data set.
+
+```{r message = F}
+Data <- read_csv(paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermData.csv',sep=''))
+Data <- merge(Data,EnrollmentStability, by="StudentID")
+Data <- merge(Data,GPAStability, by="StudentID")
+Data <- merge(Data,MajorChanges, by="StudentID")
+Data$MajorChanges <- as.factor(Data$MajorChanges)
+```
+
+#### Plot the variables to see whether they have predictive power for student dropout.
+
+```{r message = F}
+plot_dropoutrate_by_var('EnrollmentStability','')
+plot_dropoutrate_by_var('GPASlope','NumTermsEnrolled')
+plot_dropoutrate_by_var('MajorChanges','NumTermsEnrolled')
+```
+
+#### Save New Table
+
+```{r message = F}
+write_csv(Data, paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermDataWithTimeFeatures.csv',sep=''))
+```
+
+### We reran some of those initial models including these new variables. But as we were getting extremely high F1 values, we suspected that we were using variables in the model which were leading to "target leakage". Meaning the variables collected over time, while useful in predicting dropout in hindsight, would not be practically useful or even available in real time. Thus, we also tried running the models without variables we deemed as potentially problematic.
+
+#### Load Data:
+
+```{r message = F}
+
+use_plug = T; # will exclude the leakage variables when set to TRUE
+
+Data <- read_csv(paste(path,'/hud4050studentdropoutfall22/ReformattedLastTermDataWithTimeFeatures.csv',sep=''))
+
+# remove some variables
+StudentID <- select(Data,c("StudentID","Dropout")) # save dropout labels per student ID
+Data <- select(Data,-c("StudentID","Major2","CompleteCIP1","HSDipYr","HSGPAUnwtd","NumColCredAttemptTransfer","Adjusted Gross Income","Parent Adjusted Gross Income","BirthYear","BirthMonth","Birth_date"))
+
+# convert some variables to factor (from numerical)
+vars = c("Dropout","CohortTerm","Gender","HSDip","EnrollmentStatus","HighDeg","MathPlacement","EngPlacement","GatewayMathStatus","GatewayEnglishStatus","Term","CompleteDevMath","CompleteDevEnglish","RealNA","MajorChanges")
+Data[vars] <- lapply(Data[vars], factor)  ## as.factor() could also be used
+
+# Data$HSDipYr[Data$HSDipYr==-1] <- NaN
+# Data$HSGPAUnwtd[Data$HSGPAUnwtd==-1] <- NaN
+Data$NumColCredAcceptTransfer[Data$NumColCredAcceptTransfer<0] = 0
+Data$Age[is.na(Data$Age)] = mean(Data$Age,na.rm=T)
+
+# remove leakage variables if decided
+if (use_plug){
+  # leakagevars = c("Complete1","NumTermsEnrolled","TimeEnrolled","TotalDebt",
+  #               "TotalGrants","TotalScholarships","TotalWorkStudy",
+  #               "RealNA","AcademicYear","Cohort","RegistrationDate")
+  leakagevars = c("Complete1","NumTermsEnrolled","TimeEnrolled","TotalDebt",
+                "TotalGrants","TotalScholarships","TotalWorkStudy",
+                "RealNA","AcademicYear","Cohort","RegistrationDate",
+                "2012 Loan","2012 Scholarship","2012 Work/Study","2012 Grant","2013 Loan","2013 Scholarship","2013 Work/Study","2013 Grant","2014 Loan","2014 Scholarship","2014 Work/Study","2014 Grant","2015 Loan","2015 Scholarship","2015 Work/Study","2015 Grant","2016 Loan","2016 Scholarship","2016 Work/Study","2016 Grant","2017 Loan","2017 Scholarship","2017 Work/Study","2017 Grant")
+  Data <- select(Data,-leakagevars)
+}
+
+```
+
+#### Create test and train set:
+
+```{r message = F}
+
+# kaggle test and train set
+test.kaggle <- filter(Data, is.na(Dropout))
+train.kaggle <- filter(Data, !is.na(Dropout))
+
+# local test and train set
+intrain <- createDataPartition(train.kaggle[[1]],p=0.80,list = FALSE)
+train.dat <- train.kaggle[intrain,]
+test.dat <- train.kaggle[-intrain,]
+
+# cross validation setting
+trctrl <- trainControl(method="cv", number=10)
+
+```
+
+#### Useful Functions
+
+```{r message = F}
+
+get_metric <- function(cm,metric){
+  ind = names(cm$overall)==metric
+  if (sum(ind)==1){
+    x = cm$overall[ind]
+  }
+  else{
+    ind = names(cm$byClass)==metric
+    if (sum(ind)==1){
+      x = cm$byClass[ind]
+    }
+    else{
+      x = NaN
+    }
+  }
+  return(x)
+}
+
+print_metrics <- function(cm,metrics){
+  rnd_dig = 4 # number of digits to round to
+  for (m in metrics){
+    x = get_metric(cm,m)
+    if (is.na(x)){
+      x = "Not Found"
+    }
+    else{
+      x = round(x,rnd_dig)
+    }
+    cat(m,"=",x,"\n")
+  }
+}
+
+```
+
+#### Logistic Regression model:
+
+```{r message = F}
+
+set.seed(1337)
+logitmodel <- train(Dropout ~ ., method='glm',
+                preProcess=c('scale', 'center'), 
+                data=train.dat, 
+                trControl=trctrl,
+                family=binomial(link='logit'),
+                na.action=na.exclude
+                )
+
+summary(logitmodel)
+
+#Predict model
+probabilities_logit <-  predict(logitmodel, newdata=test.dat, type = "prob")
+predictions_logit <- as.factor(ifelse(probabilities_logit$'1'>0.5,1,0))
+cm_logit <- confusionMatrix(predictions_logit, test.dat$Dropout, positive="1")
+print(cm_logit)
+print_metrics(cm_logit,'F1')
+# F1 = 0.9773 with leakage variables
+# F1 = 0.805 without leakage variables
+
+```
+
+#### Kaggle Predictions
+
+```{r message = F}
+set.seed(1337)
+logitmodel <- train(Dropout ~ ., method='glm',
+                    preProcess=c('scale', 'center'), 
+                    data=train.kaggle, 
+                    trControl=trctrl,
+                    family=binomial(link='logit'),
+                    na.action=na.exclude
+                    )
+
+probabilities_logit <-  predict(logitmodel, newdata=test.kaggle, type = "prob")
+predictions_logit <- as.factor(ifelse(probabilities_logit$'1'>0.5,1,0))
+
+# save predictions
+X = data.frame(StudentID=StudentID$StudentID[is.na(StudentID$Dropout)], Dropout=predictions_logit)
+filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Logit_Submission_Time.csv',sep='')
+if (use_plug){
+  filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Logit_Submission_Time_Plugged.csv',sep='')
+}
+write_csv(X, filename)
+
+```
+
+#### Gradient boost model:
+
+```{r message = F}
+
+# WARNING: THIS CODE PRODUCES A LOT OF WARNINGS THAT WE CAN'T SUPPRESS
+
+set.seed(1337)
+boost_fit <- train(Dropout ~ ., method = "xgbTree",
+                   data=train.dat,
+                   na.action=na.exclude,
+                   trControl=trctrl,
+                   probability = TRUE)
+
+#Predict model
+probabilities_boost <- predict(boost_fit, newdata = test.dat, type = "prob")
+predictions_boost <- as.factor(ifelse(probabilities_boost$'1'>0.5,1,0))
+cm_boost <- confusionMatrix(predictions_boost, test.dat$Dropout, positive="1")
+print(cm_boost)
+print_metrics(cm_boost,'F1')
+# F1 = 0.9942 with leakage variables
+# F1 = 0.8002 without leakage variables
+
+varImp(boost_fit)
+```
+
+#### Kaggle Predictions
+
+```{r message = F}
+
+set.seed(1337)
+boost_fit <- train(Dropout ~ ., method = "xgbTree",
+                   data=train.kaggle,
+                   na.action=na.exclude,
+                   trControl=trctrl)
+
+#Predict
+probabilities_boost <- predict(boost_fit, newdata = test.kaggle, type = "prob")
+predictions_boost <- as.factor(ifelse(probabilities_boost$'1'>0.5,1,0))
+
+#save xgb boost predictions:
+X = data.frame(StudentID=StudentID$StudentID[is.na(StudentID$Dropout)], Dropout=predictions_boost)
+filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Boost_Submission_Time.csv',sep='')
+if (use_plug){
+  filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Boost_Submission_Time_Plugged.csv',sep='')
+}
+write_csv(X, filename)
+
+```
+
+#### Gradient Boost with SMOTE. We further enhanced our predictions of our highest performing model using SMOTE which is a algorithm to deal with imbalanced data. SMOTE will synthesize data from the minority set. Using SMOTE gave a slightly higher F-measure on our predictions with the gradient boost model.
+
+```{r message = F}
+#Smote
+trctrl_smote <- trainControl(method = "cv", number=10, sampling="smote")
+set.seed(1337)
+boost_smote_fit <- train(Dropout ~ ., method = "xgbTree",
+                   data=train.dat,
+                   na.action=na.exclude,
+                   trControl=trctrl_smote)
+
+# Probabilities 
+probabilities_boost_smote <- predict(boost_smote_fit, newdata = test.dat, type = "prob")
+
+# ROC
+roc_curve <- roc(as.numeric(test.dat$Dropout==1),probabilities_boost_smote$`1`)
+roc_curve$auc
+plot(roc_curve, print.thres="best", print.auc=T)
+
+# predicitions
+best_thresh <- coords(roc_curve, "best", ret="threshold")[[1]]
+predictions_boost_smote <- as.factor(ifelse(probabilities_boost_smote$'1'>best_thresh,1,0))
+cm_boost_smote <- confusionMatrix(predictions_boost_smote, test.dat$Dropout, positive="1")
+print(cm_boost_smote)
+print_metrics(cm_boost_smote,'F1')
+# F1 = XXXXXX with leakage variables
+# F1 = 0.8152 without leakage variables
+
+varImp(boost_smote_fit)
+
+```
+
+#### Kaggle Predictions
+
+```{r message = F}
+set.seed(1337)
+boost_smote_fit <- train(Dropout ~ ., method = "xgbTree",
+                   data=train.kaggle,
+                   na.action=na.exclude,
+                   trControl=trctrl_smote)
+
+#Predict
+probabilities_boost_smote <- predict(boost_smote_fit, newdata = test.kaggle, type = "prob")
+predictions_boost_smote <- as.factor(ifelse(probabilities_boost_smote$'1'>0.5,1,0))
+
+#save xgb boost predictions:
+X = data.frame(StudentID=StudentID$StudentID[is.na(StudentID$Dropout)], Dropout=predictions_boost_smote)
+filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Boost_Smote_Submission_Time.csv',sep='')
+if (use_plug){
+  filename <- paste(path,'/hud4050studentdropoutfall22/Group1_Boost_Smote_Submission_Time_Plugged.csv',sep='')
+}
+write_csv(X, filename)
+```
+
+# ##6. Conclusions and insights using partial dependence plots for our best performing model (XBG Boost)
+
+### Partial dependence plots show the marginal effect a predictor has on the predicted outcome of a machine learning model while holding all other predictors in the model constant. We thus used these partial dependence plots to visualize and analyze the interaction between student dropout and a set of input features that we chose based on variable importance.
+
+```{r}
+
+library(pdp)
+
+suppressWarnings({
+  
+  partial(boost_fit, pred.var = "GPASlope", plot = TRUE, plot.engine = "ggplot", prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "TermGPA", plot = TRUE, plot.engine = "ggplot", prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "CumGPA", plot = TRUE, plot.engine = "ggplot", prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "Major1", plot = TRUE,  prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "AvgGrantsPerTerm", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "AvgDebtPerTerm", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "Age", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "EnrollmentStability", plot = TRUE,  prob = TRUE, which.class = 2)
+  
+  partial(boost_fit, pred.var = "EnrollmentStability", plot = TRUE,  prob = TRUE, which.class = 2)
+
+})
+
+```
+
+### For easier interpretability, we also generated partial dependence plots on our logistic regression model to infer the [linear]{.underline} relationship between the same set of predictors used above and our target response variable (student dropout).
+
+```{r}
+
+suppressWarnings({
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "TermGPA", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "CumGPA", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "AvgDebtPerTerm", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "AvgGrantsPerTerm", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "Major1", plot = TRUE,  prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "GPASlope", plot = TRUE,  plot.engine = "ggplot", prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "EnrollmentStability", plot = TRUE,   prob = TRUE, which.class = 2)
+  
+  partial(logitmodel, train = train.kaggle, pred.var = "Age", plot = TRUE, plot.engine = "ggplot",  prob = TRUE, which.class = 2)
+  
+})
+
+
+```
